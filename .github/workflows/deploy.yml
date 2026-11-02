@@ -1,0 +1,163 @@
+name: CD - Build, Push, Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7.0.1
+
+      - name: Authenticate to AWS (keyless, OIDC)
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_CD_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: gha-build-${{ github.run_id }}
+
+      - name: Create .env from Secrets Manager
+        env:
+          SECRET_IDS: ${{ vars.AWS_SECRET_IDS }}
+        run: |
+          set -euo pipefail
+          umask 077
+          : > .env
+          for SECRET_ID in $SECRET_IDS; do
+            JSON=$(aws secretsmanager get-secret-value \
+                     --secret-id "$SECRET_ID" \
+                     --query SecretString --output text)
+            
+            echo "$JSON" | jq -r '.[]' | while IFS= read -r VALUE; do
+              if [ -n "$VALUE" ]; then echo "::add-mask::$VALUE"; fi
+            done
+            
+            echo "$JSON" | jq -r 'to_entries[] | "\(.key)=\(.value|@sh)"' >> .env
+          done
+          
+          set -a; . ./.env; set +a
+          for V in DOCKERHUB_USERNAME DOCKERHUB_TOKEN; do
+            [ -n "${!V:-}" ] || { echo "Missing required key in secrets: $V"; exit 1; }
+          done
+
+      - name: Build and push images
+        run: |
+          set -euo pipefail
+          set -a; . ./.env; set +a
+          echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
+          for SVC in backend frontend; do
+            IMG="$DOCKERHUB_USERNAME/simple-app-$SVC"
+            docker build -t "$IMG:$GITHUB_SHA" -t "$IMG:latest" "./$SVC"
+            docker push "$IMG:$GITHUB_SHA"
+            docker push "$IMG:latest"
+          done
+
+      - name: Cleanup credentials (always)
+        if: always()
+        run: |
+          docker logout || true
+          shred -u .env 2>/dev/null || rm -f .env
+
+  deploy:
+    needs: build-and-push
+    runs-on: [self-hosted]
+    environment: production
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7.0.1
+
+      - name: Authenticate to AWS (keyless, OIDC)
+        uses: aws-actions/configure-aws-credentials@v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_CD_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: gha-deploy-${{ github.run_id }}
+
+      - name: Create .env from Secrets Manager
+        env:
+          SECRET_IDS: ${{ vars.AWS_SECRET_IDS }}
+        run: |
+          set -euo pipefail
+          umask 077
+          : > .env
+          for SECRET_ID in $SECRET_IDS; do
+            JSON=$(aws secretsmanager get-secret-value \
+                     --secret-id "$SECRET_ID" \
+                     --query SecretString --output text)
+            echo "$JSON" | jq -r '.[]' | while IFS= read -r VALUE; do
+              if [ -n "$VALUE" ]; then echo "::add-mask::$VALUE"; fi
+            done
+            echo "$JSON" | jq -r 'to_entries[] | "\(.key)=\(.value|@sh)"' >> .env
+          done
+          set -a; . ./.env; set +a
+          for V in DOCKERHUB_USERNAME DOCKERHUB_TOKEN; do
+            [ -n "${!V:-}" ] || { echo "Missing required key in secrets: $V"; exit 1; }
+          done
+
+      - name: Login to Docker Hub on the server
+        run: |
+          set -euo pipefail
+          set -a; . ./.env; set +a
+          echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
+
+      - name: Deploy with health check and automatic rollback
+        run: |
+          set -uo pipefail
+          set -a; . ./.env; set +a
+          export IMAGE_TAG="$GITHUB_SHA"
+
+          DEPLOY_DIR="$HOME/deploy/simple-app"
+          mkdir -p "$DEPLOY_DIR"
+          cp docker-compose.prod.yml "$DEPLOY_DIR/docker-compose.template.yml"
+          cp check-health.sh "$DEPLOY_DIR/check-health.sh"
+          chmod +x "$DEPLOY_DIR/check-health.sh"
+          cd "$DEPLOY_DIR"
+
+          docker compose -f docker-compose.template.yml config > docker-compose.new.yml || exit 1
+          docker compose -f docker-compose.new.yml pull || exit 1
+
+          if [ -f docker-compose.yml ]; then
+            cp docker-compose.yml docker-compose.backup.yml
+            docker compose -f docker-compose.yml down
+          fi
+
+          if docker compose -f docker-compose.new.yml up -d --wait \
+             && ./check-health.sh docker-compose.new.yml; then
+            mv docker-compose.new.yml docker-compose.yml
+            echo "Deployment healthy"
+            docker compose ps
+          else
+            echo "New version failed the health check. Rolling back..."
+            docker compose -f docker-compose.new.yml down || true
+            if [ -f docker-compose.backup.yml ]; then
+              docker compose -f docker-compose.backup.yml up -d --wait
+              echo "Rolled back to the previous version"
+            fi
+            exit 1
+          fi
+
+      - name: Public smoke test
+        continue-on-error: true
+        run: |
+          set -a; . ./.env; set +a
+          if [ -z "${SERVER_HOST:-}" ]; then echo "SERVER_HOST not in secrets, skipping"; exit 0; fi
+          curl -fsS --max-time 10 "http://$SERVER_HOST/" > /dev/null && echo "Frontend reachable"
+          curl -fsS --max-time 10 "http://$SERVER_HOST:5000/health" && echo "Backend reachable"
+
+      - name: Cleanup credentials (always)
+        if: always()
+        run: |
+          docker logout || true
+          shred -u .env 2>/dev/null || rm -f .env
