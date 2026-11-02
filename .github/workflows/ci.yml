@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read      # CI needs no AWS access and no OIDC token
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7.0.1
+
+      - name: Guard - no secret-like files committed
+        run: |
+          if git ls-files | grep -E '(^|/)\.env($|\.)|\.pem$|\.key$'; then
+            echo "A secret-like file is tracked by Git. Remove it before merging."
+            exit 1
+          fi
+
+      - name: Build images
+        run: |
+          docker build -t backend:latest ./backend
+          docker build -t frontend:latest ./frontend
+
+      - name: Start application
+        run: docker compose up -d --wait
+
+      - name: Check containers
+        run: docker compose ps
+
+      - name: Run health checks
+        run: |
+          chmod +x check-health.sh
+          ./check-health.sh docker-compose.yml
+
+      - name: Show logs on failure
+        if: failure()
+        run: docker compose logs
+
+      - name: Stop application
+        if: always()
+        run: docker compose down
